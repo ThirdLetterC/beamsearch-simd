@@ -12,6 +12,7 @@ static constexpr size_t BEAMSEARCH_INVALID_NODE = SIZE_MAX;
 static constexpr size_t BEAMSEARCH_MIN_HASH_CAPACITY = 16;
 static constexpr size_t BEAMSEARCH_MIN_THREADED_SELECT_TOKENS = 16'384;
 static constexpr size_t BEAMSEARCH_MIN_THREADED_EXPANSIONS = 2'048;
+static constexpr size_t BEAMSEARCH_MAX_WORKER_THREADS = 64;
 static constexpr uint32_t BEAMSEARCH_INITIAL_EPOCH = 1;
 
 typedef struct {
@@ -171,6 +172,37 @@ static size_t grow_capacity(size_t current, size_t required) {
         capacity *= 2;
     }
     return capacity;
+}
+
+[[nodiscard]]
+static size_t sanitize_thread_count(size_t requested) {
+    if (requested < 2) {
+        return 1;
+    }
+    if (requested > BEAMSEARCH_MAX_WORKER_THREADS) {
+        return BEAMSEARCH_MAX_WORKER_THREADS;
+    }
+    return requested;
+}
+
+static void partition_range(size_t count,
+                            size_t parts,
+                            size_t index,
+                            size_t *begin_out,
+                            size_t *end_out) {
+    if (parts == 0 || index >= parts) {
+        *begin_out = 0;
+        *end_out = 0;
+        return;
+    }
+
+    auto base = count / parts;
+    auto remainder = count % parts;
+    auto extra_before = index < remainder ? index : remainder;
+    auto begin = index * base + extra_before;
+
+    *begin_out = begin;
+    *end_out = begin + base + (index < remainder ? 1 : 0);
 }
 
 [[nodiscard]]
@@ -776,7 +808,7 @@ static void select_top_tokens_range(int32_t *tokens,
                                     int32_t blank_id) {
     constexpr size_t lanes = 8;
     auto token = begin;
-    while (token + lanes <= end) {
+    while (end - token >= lanes) {
         auto chunk = psimd_loadu_f32x8(frame + token);
         auto chunk_best = psimd_reduce_max_f32x8(chunk);
         if (*selected_count < cutoff || chunk_best > scores[cutoff - 1]) {
@@ -1158,8 +1190,9 @@ static bool prepare_workers(beamsearch_decoder_t *decoder,
     }
 
     for (size_t i = 0; i < thread_count; i += 1) {
-        auto begin = (i * decoder->current_count) / thread_count;
-        auto end = ((i + 1) * decoder->current_count) / thread_count;
+        size_t begin = 0;
+        size_t end = 0;
+        partition_range(decoder->current_count, thread_count, i, &begin, &end);
         size_t worker_capacity = 0;
         if (!checked_mul_size(end - begin, per_beam_transitions,
                               &worker_capacity)) {
@@ -1197,8 +1230,9 @@ static bool prepare_select_workers(beamsearch_decoder_t *decoder,
             return false;
         }
 
-        auto begin = (i * vocab_size) / thread_count;
-        auto end = ((i + 1) * vocab_size) / thread_count;
+        size_t begin = 0;
+        size_t end = 0;
+        partition_range(vocab_size, thread_count, i, &begin, &end);
         decoder->workers[i].decoder = decoder;
         decoder->workers[i].frame = frame;
         decoder->workers[i].vocab_begin = begin;
@@ -1259,23 +1293,38 @@ static void stop_worker_pool(beamsearch_decoder_t *decoder) {
 }
 
 [[nodiscard]]
-static bool start_worker_pool(beamsearch_decoder_t *decoder) {
-    if (decoder->thread_count < 2 || decoder->workers_started) {
+static bool start_worker_pool(beamsearch_decoder_t *decoder,
+                              size_t requested_thread_count) {
+    if (requested_thread_count < 2) {
         return true;
     }
-    if (!ensure_worker_capacity(decoder, decoder->thread_count) ||
+    if (requested_thread_count > decoder->thread_count) {
+        requested_thread_count = decoder->thread_count;
+    }
+    if (requested_thread_count < 2) {
+        return true;
+    }
+    if (decoder->workers_started &&
+        decoder->worker_count >= requested_thread_count) {
+        return true;
+    }
+    if (decoder->workers_started) {
+        stop_worker_pool(decoder);
+    }
+
+    if (!ensure_worker_capacity(decoder, requested_thread_count) ||
         !init_worker_sync(decoder)) {
         return false;
     }
 
     decoder->worker_stop = false;
-    decoder->worker_count = decoder->thread_count;
+    decoder->worker_count = requested_thread_count;
     decoder->active_worker_count = 0;
     decoder->workers_done = 0;
     decoder->worker_generation = 0;
 
     size_t started = 0;
-    for (size_t i = 0; i < decoder->thread_count; i += 1) {
+    for (size_t i = 0; i < requested_thread_count; i += 1) {
         decoder->workers[i].decoder = decoder;
         decoder->workers[i].worker_index = i;
         decoder->workers[i].seen_generation = 0;
@@ -1357,7 +1406,7 @@ static bool select_top_tokens_threaded(beamsearch_decoder_t *decoder,
         return true;
     }
 
-    if (!start_worker_pool(decoder) ||
+    if (!start_worker_pool(decoder, thread_count) ||
         !prepare_select_workers(decoder, frame, vocab_size, cutoff,
                                 thread_count) ||
         !run_worker_task(decoder, beamsearch_worker_task_select,
@@ -1400,7 +1449,7 @@ static bool expand_frame_threaded(beamsearch_decoder_t *decoder,
     }
 
     if (!precompute_expanded_children(decoder, selected_count) ||
-        !start_worker_pool(decoder)) {
+        !start_worker_pool(decoder, thread_count)) {
         return false;
     }
 
@@ -1448,9 +1497,8 @@ beamsearch_decoder_t *beamsearch_decoder_create(
     }
 
     decoder->config = *config;
-    if (decoder->config.thread_count == 0) {
-        decoder->config.thread_count = 1;
-    }
+    decoder->config.thread_count =
+        sanitize_thread_count(decoder->config.thread_count);
     decoder->thread_count = decoder->config.thread_count;
     decoder->accum_epoch = BEAMSEARCH_INITIAL_EPOCH;
 

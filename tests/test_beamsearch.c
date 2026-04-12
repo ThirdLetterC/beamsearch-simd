@@ -188,7 +188,18 @@ static void test_invalid_arguments() {
     check(beamsearch_decoder_create(&bad_config) == nullptr,
           "invalid create rejects zero beam");
 
+    bad_config.beam_width = 1;
+    bad_config.token_cutoff = 0;
+    check(beamsearch_decoder_create(&bad_config) == nullptr,
+          "invalid create rejects zero cutoff");
+
+    bad_config.token_cutoff = 1;
+    bad_config.blank_id = -1;
+    check(beamsearch_decoder_create(&bad_config) == nullptr,
+          "invalid create rejects negative blank");
+
     auto decoder = new_decoder(2, 1, 0);
+    auto bad_blank_decoder = new_decoder(2, 1, 3);
     beamsearch_result_t result = {0};
     float frame[2] = {logf(0.6f), logf(0.4f)};
 
@@ -204,8 +215,62 @@ static void test_invalid_arguments() {
                                     &result) ==
               beamsearch_status_invalid_argument,
           "invalid null log probs");
+    check(beamsearch_decoder_decode(decoder, frame, 1, 0, nullptr, 0,
+                                    &result) ==
+              beamsearch_status_invalid_argument,
+          "invalid zero vocab");
+    check(beamsearch_decoder_decode(bad_blank_decoder, frame, 1, 2, nullptr, 0,
+                                    &result) ==
+              beamsearch_status_invalid_argument,
+          "invalid blank outside vocab");
+    check(beamsearch_decoder_decode(decoder, nullptr, 2, SIZE_MAX, nullptr, 0,
+                                    &result) ==
+              beamsearch_status_invalid_argument,
+          "invalid overflowing shape");
+    check(beamsearch_decoder_decode(decoder, frame, 1,
+                                    (size_t)INT32_MAX + 2, nullptr, 0,
+                                    &result) ==
+              beamsearch_status_invalid_argument,
+          "invalid vocab exceeds int32 token ids");
+    check(beamsearch_decoder_decode(decoder, frame, 1, 2, nullptr, 0,
+                                    nullptr) ==
+              beamsearch_status_invalid_argument,
+          "invalid null result");
+
+    beamsearch_decoder_destroy(bad_blank_decoder);
+    beamsearch_decoder_destroy(decoder);
+}
+
+static void test_thread_count_is_bounded() {
+    constexpr size_t vocab_size = 16'384;
+    auto decoder = new_decoder_threads(4, 2, 0, SIZE_MAX);
+    float *log_probs = (float *)calloc(vocab_size, sizeof(float));
+    int32_t output[1] = {0};
+    beamsearch_result_t result = {0};
+
+    check(decoder != nullptr && log_probs != nullptr, "huge threads setup");
+    if (decoder == nullptr || log_probs == nullptr) {
+        beamsearch_decoder_destroy(decoder);
+        free(log_probs);
+        return;
+    }
+
+    for (size_t token = 0; token < vocab_size; token += 1) {
+        log_probs[token] = -10.0f;
+    }
+    log_probs[0] = -10.0f;
+    log_probs[7] = -0.1f;
+    log_probs[11] = -0.3f;
+
+    auto status = beamsearch_decoder_decode(decoder, log_probs, 1, vocab_size,
+                                            output, 1, &result);
+
+    check(status == beamsearch_status_ok, "huge thread count status");
+    check(result.token_count == 1 && output[0] == 7,
+          "huge thread count output");
 
     beamsearch_decoder_destroy(decoder);
+    free(log_probs);
 }
 
 static void test_repeated_token_collapse() {
@@ -403,6 +468,7 @@ int main() {
     test_reference_pruned_cutoff();
     test_threaded_matches_single_thread();
     test_threaded_heavy_expansion_matches();
+    test_thread_count_is_bounded();
 
     return g_failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
