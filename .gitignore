@@ -1,0 +1,37 @@
+# Build directories
+/build/
+/cmake-build-*/
+/out/
+
+# Local binaries and objects
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+/beamsearch_test
+/beamsearch_test_avx2
+/beamsearch_bench
+/beamsearch_bench_avx2
+
+# Generated build metadata
+/compile_commands.json
+/.cache/
+
+# Sanitizer, coverage, and profiling output
+*.gcda
+*.gcno
+*.profraw
+*.profdata
+/coverage/
+/perf.data
+/perf.data.old
+
+# Editor and OS noise
+.DS_Store
+*.swp
+*.swo
+*~

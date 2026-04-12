@@ -1,0 +1,74 @@
+# beamsearch-simd
+
+Strict C23 CTC prefix beam search decoder for ASR models.
+
+The decoder consumes frame-major log probabilities:
+
+```c
+log_probs[frame * vocab_size + token]
+```
+
+It returns the single best collapsed token-id sequence and its log score. Version 1 has no language model, lexicon, tokenizer, string output, streaming state, or n-best output.
+
+## Features
+
+- Graves-style CTC prefix beam search in the log domain.
+- psimd-accelerated per-frame token pruning.
+- Parent-linked trie prefixes to avoid copying token arrays during search.
+- Optional pthread worker path for larger beam expansion workloads.
+- Caller-owned output buffer and reusable decoder scratch memory.
+
+## Build And Test
+
+This project uses strict warnings and C23/C2x. GCC 13 may require `-std=c2x`.
+
+```bash
+just check
+```
+
+Manual test build:
+
+```bash
+gcc -std=c2x -Wall -Wextra -Wpedantic -Werror -Iinclude -pthread \
+    -fsanitize=address,undefined,leak \
+    src/beamsearch.c tests/test_beamsearch.c -lm -o /tmp/beamsearch_test
+/tmp/beamsearch_test
+```
+
+## Benchmark
+
+Run the default and AVX2 benchmark builds:
+
+```bash
+just bench 1
+just bench-avx2 1
+```
+
+Compare both backends:
+
+```bash
+just bench-compare 1
+```
+
+The benchmark includes synthetic ASR shapes and 30-second, 16 kHz audio cases. The 30-second rows report `rtf`, where `0.01` means the decoder took about 1% of the audio duration.
+
+## API
+
+Public declarations are in `include/beamsearch.h`.
+
+```c
+beamsearch_config_t config = {
+    .beam_width = 12,
+    .token_cutoff = 32,
+    .blank_id = 0,
+    .thread_count = 1,
+};
+
+beamsearch_decoder_t *decoder = beamsearch_decoder_create(&config);
+```
+
+Destroy decoders with:
+
+```c
+beamsearch_decoder_destroy(decoder);
+```
