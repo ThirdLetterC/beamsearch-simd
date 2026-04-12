@@ -1,5 +1,9 @@
 #include "beamsearch.h"
 
+#ifdef BEAMSEARCH_ENABLE_CUDA
+#include "beamsearch_cuda.h"
+#endif
+
 #include "psimd/psimd.h"
 
 #include <math.h>
@@ -13,6 +17,10 @@ static constexpr size_t BEAMSEARCH_MIN_HASH_CAPACITY = 16;
 static constexpr size_t BEAMSEARCH_MIN_THREADED_SELECT_TOKENS = 16'384;
 static constexpr size_t BEAMSEARCH_MIN_THREADED_EXPANSIONS = 2'048;
 static constexpr size_t BEAMSEARCH_MAX_WORKER_THREADS = 64;
+#ifdef BEAMSEARCH_ENABLE_CUDA
+static constexpr size_t BEAMSEARCH_MIN_CUDA_SELECT_TOKENS = 65'536;
+static constexpr size_t BEAMSEARCH_MAX_CUDA_SELECT_CUTOFF = 128;
+#endif
 static constexpr uint32_t BEAMSEARCH_INITIAL_EPOCH = 1;
 
 typedef struct {
@@ -121,6 +129,17 @@ struct beamsearch_decoder {
     bool worker_sync_ready;
     bool workers_started;
     bool worker_stop;
+
+#ifdef BEAMSEARCH_ENABLE_CUDA
+    beamsearch_cuda_context_t *cuda_context;
+    int32_t *cuda_selected_tokens;
+    size_t *cuda_selected_counts;
+    size_t cuda_selected_frame_capacity;
+    size_t cuda_selected_cutoff_capacity;
+    size_t cuda_frame_capacity;
+    size_t cuda_vocab_capacity;
+    size_t cuda_cutoff_capacity;
+#endif
 };
 
 [[nodiscard]]
@@ -204,6 +223,72 @@ static void partition_range(size_t count,
     *begin_out = begin;
     *end_out = begin + base + (index < remainder ? 1 : 0);
 }
+
+#ifdef BEAMSEARCH_ENABLE_CUDA
+[[nodiscard]]
+static bool ensure_cuda_context(beamsearch_decoder_t *decoder,
+                                size_t frame_count,
+                                size_t vocab_size,
+                                size_t cutoff) {
+    if (cutoff > BEAMSEARCH_MAX_CUDA_SELECT_CUTOFF) {
+        return false;
+    }
+    if (decoder->cuda_context != nullptr &&
+        frame_count <= decoder->cuda_frame_capacity &&
+        vocab_size <= decoder->cuda_vocab_capacity &&
+        cutoff <= decoder->cuda_cutoff_capacity) {
+        return true;
+    }
+
+    beamsearch_cuda_context_destroy(decoder->cuda_context);
+    decoder->cuda_context =
+        beamsearch_cuda_context_create(frame_count, vocab_size, cutoff);
+    if (decoder->cuda_context == nullptr) {
+        decoder->cuda_frame_capacity = 0;
+        decoder->cuda_vocab_capacity = 0;
+        decoder->cuda_cutoff_capacity = 0;
+        return false;
+    }
+
+    decoder->cuda_frame_capacity = frame_count;
+    decoder->cuda_vocab_capacity = vocab_size;
+    decoder->cuda_cutoff_capacity = cutoff;
+    return true;
+}
+
+[[nodiscard]]
+static bool ensure_cuda_selected_capacity(beamsearch_decoder_t *decoder,
+                                          size_t frame_count,
+                                          size_t cutoff) {
+    if (frame_count <= decoder->cuda_selected_frame_capacity &&
+        cutoff <= decoder->cuda_selected_cutoff_capacity) {
+        return true;
+    }
+
+    size_t entry_count = 0;
+    if (!checked_mul_size(frame_count, cutoff, &entry_count)) {
+        return false;
+    }
+
+    auto tokens = (int32_t *)calloc_array(entry_count, sizeof(int32_t));
+    if (tokens == nullptr) {
+        return false;
+    }
+    auto counts = (size_t *)calloc_array(frame_count, sizeof(size_t));
+    if (counts == nullptr) {
+        free(tokens);
+        return false;
+    }
+
+    free(decoder->cuda_selected_tokens);
+    free(decoder->cuda_selected_counts);
+    decoder->cuda_selected_tokens = tokens;
+    decoder->cuda_selected_counts = counts;
+    decoder->cuda_selected_frame_capacity = frame_count;
+    decoder->cuda_selected_cutoff_capacity = cutoff;
+    return true;
+}
+#endif
 
 [[nodiscard]]
 static bool hash_capacity_for(size_t required_entries, size_t *capacity_out) {
@@ -873,6 +958,17 @@ static bool select_top_tokens(beamsearch_decoder_t *decoder,
         return true;
     }
 
+#ifdef BEAMSEARCH_ENABLE_CUDA
+    if (vocab_size >= BEAMSEARCH_MIN_CUDA_SELECT_TOKENS &&
+        ensure_cuda_context(decoder, 1, vocab_size, cutoff) &&
+        beamsearch_cuda_select_top_tokens(
+            decoder->cuda_context, frame, vocab_size, cutoff,
+            decoder->config.blank_id, decoder->selected_tokens,
+            decoder->selected_scores, selected_count_out)) {
+        return true;
+    }
+#endif
+
     if (decoder->thread_count > 1 &&
         vocab_size >= BEAMSEARCH_MIN_THREADED_SELECT_TOKENS) {
         return select_top_tokens_threaded(decoder, frame, vocab_size, cutoff,
@@ -1532,6 +1628,11 @@ void beamsearch_decoder_destroy(beamsearch_decoder_t *decoder) {
     free(decoder->selected_tokens);
     free(decoder->selected_scores);
     free(decoder->expanded_children);
+#ifdef BEAMSEARCH_ENABLE_CUDA
+    beamsearch_cuda_context_destroy(decoder->cuda_context);
+    free(decoder->cuda_selected_tokens);
+    free(decoder->cuda_selected_counts);
+#endif
     for (size_t i = 0; i < decoder->worker_capacity; i += 1) {
         free(decoder->workers[i].local_tokens);
         free(decoder->workers[i].local_scores);
@@ -1579,10 +1680,45 @@ beamsearch_status_t beamsearch_decoder_decode(
     decoder->current_beams[0].score = 0.0f;
     decoder->next_count = 0;
 
+#ifdef BEAMSEARCH_ENABLE_CUDA
+    bool use_cuda_preselected = false;
+    auto cuda_cutoff = decoder->config.token_cutoff;
+    auto available_tokens = nonblank_token_count(vocab_size);
+    if (cuda_cutoff > available_tokens) {
+        cuda_cutoff = available_tokens;
+    }
+    if (vocab_size >= BEAMSEARCH_MIN_CUDA_SELECT_TOKENS &&
+        cuda_cutoff != 0 &&
+        decoder->config.token_cutoff < available_tokens &&
+        ensure_cuda_context(decoder, frame_count, vocab_size, cuda_cutoff) &&
+        ensure_cuda_selected_capacity(decoder, frame_count, cuda_cutoff) &&
+        beamsearch_cuda_select_top_tokens_batch(
+            decoder->cuda_context, log_probs, frame_count, vocab_size,
+            cuda_cutoff, decoder->config.blank_id,
+            decoder->cuda_selected_tokens, decoder->cuda_selected_counts)) {
+        use_cuda_preselected = true;
+    }
+#endif
+
     for (size_t frame_index = 0; frame_index < frame_count; frame_index += 1) {
         auto frame = log_probs + frame_index * vocab_size;
         size_t selected_count = 0;
 
+#ifdef BEAMSEARCH_ENABLE_CUDA
+        if (use_cuda_preselected) {
+            selected_count = decoder->cuda_selected_counts[frame_index];
+            if (selected_count > cuda_cutoff ||
+                !ensure_selected_token_capacity(decoder, selected_count)) {
+                return beamsearch_status_out_of_memory;
+            }
+            if (selected_count != 0) {
+                memcpy(decoder->selected_tokens,
+                       decoder->cuda_selected_tokens +
+                           frame_index * cuda_cutoff,
+                       selected_count * sizeof(decoder->selected_tokens[0]));
+            }
+        } else
+#endif
         if (!select_top_tokens(decoder, frame, vocab_size, &selected_count)) {
             return beamsearch_status_out_of_memory;
         }

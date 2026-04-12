@@ -14,6 +14,7 @@ It returns the single best collapsed token-id sequence and its log score. Versio
 
 - Graves-style CTC prefix beam search in the log domain.
 - psimd-accelerated per-frame token pruning.
+- Optional CUDA per-frame token pruning for very large vocabularies.
 - Parent-linked trie prefixes to avoid copying token arrays during search.
 - Optional pthread worker path for larger beam expansion workloads.
 - Caller-owned output buffer and reusable decoder scratch memory.
@@ -49,6 +50,19 @@ Compare both backends:
 ```bash
 just bench-compare 1
 ```
+
+CUDA token-pruning builds require `nvcc` and define
+`BEAMSEARCH_ENABLE_CUDA` for `src/beamsearch.c`:
+
+```bash
+just check-cuda
+just bench-cuda 1
+```
+
+The CUDA path accelerates the top-token selection stage for large vocabularies
+and falls back to the existing CPU selection path when CUDA is not compiled in,
+when the vocabulary is below the CUDA threshold, or when a CUDA context cannot
+be created.
 
 The benchmark includes synthetic ASR shapes and 30-second, 16 kHz audio cases. The 30-second rows report `rtf`, where `0.01` means the decoder took about 1% of the audio duration.
 

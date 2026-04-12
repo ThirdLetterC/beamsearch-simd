@@ -4,6 +4,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef enum {
     beamsearch_status_ok = 0,
     beamsearch_status_invalid_argument,
@@ -55,5 +59,9 @@ beamsearch_status_t beamsearch_decoder_decode(
     int32_t *output_tokens,
     size_t output_capacity,
     beamsearch_result_t *result);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -67,6 +67,10 @@ An attacker may influence:
   metadata and are rebuilt through fresh zeroed storage when capacity grows.
 - Top-token selection excludes the configured blank token and clamps
   `token_cutoff` to the number of nonblank tokens available in the vocabulary.
+- When compiled with `BEAMSEARCH_ENABLE_CUDA`, very large-vocabulary top-token
+  selection may run through an optional CUDA context. CUDA context creation and
+  selection failures fall back to the CPU path; decoder-owned CUDA buffers are
+  released by `beamsearch_decoder_destroy`.
 - Output reconstruction is delayed until after the best prefix length is known.
   If `output_capacity` is too small, the function returns
   `beamsearch_status_output_too_small` and reports the required length in
@@ -106,6 +110,8 @@ An attacker may influence:
   synchronization.
 - `include/psimd/` is vendored code. Keep local changes isolated and review
   backend-specific intrinsic changes separately.
+- CUDA builds add the CUDA runtime and GPU driver to the trusted computing base.
+  Use CPU-only builds when that dependency is not acceptable.
 
 ## Build Hardening
 
@@ -118,6 +124,8 @@ An attacker may influence:
   `-fno-omit-frame-pointer` when stack traces are required.
 - `just test-avx2` exercises the AVX2/FMA code generation path with
   `-mavx2 -mfma`.
+- `just check-cuda` compiles the optional CUDA token-pruning backend with
+  `nvcc` and runs the unit tests through a CUDA-enabled decoder build.
 - Production embedders should add their platform hardening flags around the
   library build, such as `-fstack-protector-strong`, `_FORTIFY_SOURCE` where
   supported by the optimization level and libc, PIE, and RELRO/now linking.

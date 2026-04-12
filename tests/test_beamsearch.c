@@ -242,7 +242,7 @@ static void test_invalid_arguments() {
 }
 
 static void test_thread_count_is_bounded() {
-    constexpr size_t vocab_size = 16'384;
+    constexpr size_t vocab_size = 65'536;
     auto decoder = new_decoder_threads(4, 2, 0, SIZE_MAX);
     float *log_probs = (float *)calloc(vocab_size, sizeof(float));
     int32_t output[1] = {0};
