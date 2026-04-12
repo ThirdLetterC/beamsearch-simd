@@ -47,7 +47,7 @@ bench scale="1":
 
 bench-cuda scale="1":
     @{{cc}} {{cuda_cflags}} -O3 -c src/beamsearch.c -o /tmp/beamsearch_cuda_cpu.o
-    @{{cc}} {{cflags}} -O3 -c benchmark/run.c -o /tmp/beamsearch_cuda_bench_main.o
+    @{{cc}} {{cuda_cflags}} -O3 -c benchmark/run.c -o /tmp/beamsearch_cuda_bench_main.o
     @{{nvcc}} {{cuda_nvccflags}} -O3 -c src/beamsearch_cuda.cu -o /tmp/beamsearch_cuda.o
     @{{nvcc}} /tmp/beamsearch_cuda_cpu.o /tmp/beamsearch_cuda.o /tmp/beamsearch_cuda_bench_main.o -lm -lpthread -o /tmp/beamsearch_cuda_bench
     @/tmp/beamsearch_cuda_bench {{scale}}

@@ -418,8 +418,50 @@ bool beamsearch_cuda_select_top_tokens_batch(beamsearch_cuda_context_t *context,
                                              int32_t blank_id,
                                              int32_t *tokens,
                                              size_t *selected_counts) {
-    if (context == nullptr || log_probs == nullptr || tokens == nullptr ||
-        selected_counts == nullptr || frame_count == 0 ||
+    if (!beamsearch_cuda_upload_log_probs(context, log_probs, frame_count,
+                                          vocab_size)) {
+        return false;
+    }
+    return beamsearch_cuda_select_top_tokens_batch_device(
+        context, frame_count, vocab_size, cutoff, blank_id, tokens,
+        selected_counts);
+}
+
+bool beamsearch_cuda_upload_log_probs(beamsearch_cuda_context_t *context,
+                                      const float *log_probs,
+                                      size_t frame_count,
+                                      size_t vocab_size) {
+    if (context == nullptr || log_probs == nullptr || frame_count == 0 ||
+        vocab_size == 0 || frame_count > context->max_frame_count ||
+        vocab_size > context->max_vocab_size) {
+        return false;
+    }
+
+    size_t value_count = 0;
+    size_t frame_bytes = 0;
+    if (!checked_mul_size(frame_count, vocab_size, &value_count) ||
+        !checked_mul_size(value_count, sizeof(float), &frame_bytes)) {
+        return false;
+    }
+
+    if (cudaMemcpy(context->device_frame, log_probs, frame_bytes,
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+        return false;
+    }
+
+    return cudaDeviceSynchronize() == cudaSuccess;
+}
+
+bool beamsearch_cuda_select_top_tokens_batch_device(
+    beamsearch_cuda_context_t *context,
+    size_t frame_count,
+    size_t vocab_size,
+    size_t cutoff,
+    int32_t blank_id,
+    int32_t *tokens,
+    size_t *selected_counts) {
+    if (context == nullptr || tokens == nullptr || selected_counts == nullptr ||
+        frame_count == 0 ||
         frame_count > BEAMSEARCH_CUDA_MAX_GRID_FRAMES || vocab_size == 0 ||
         cutoff == 0 || frame_count > context->max_frame_count ||
         vocab_size > context->max_vocab_size || cutoff > context->max_cutoff ||
@@ -434,21 +476,12 @@ bool beamsearch_cuda_select_top_tokens_batch(beamsearch_cuda_context_t *context,
         return false;
     }
 
-    size_t value_count = 0;
-    size_t frame_bytes = 0;
     size_t token_count = 0;
     size_t token_bytes = 0;
     size_t count_bytes = 0;
-    if (!checked_mul_size(frame_count, vocab_size, &value_count) ||
-        !checked_mul_size(value_count, sizeof(float), &frame_bytes) ||
-        !checked_mul_size(frame_count, cutoff, &token_count) ||
+    if (!checked_mul_size(frame_count, cutoff, &token_count) ||
         !checked_mul_size(token_count, sizeof(int32_t), &token_bytes) ||
         !checked_mul_size(frame_count, sizeof(size_t), &count_bytes)) {
-        return false;
-    }
-
-    if (cudaMemcpy(context->device_frame, log_probs, frame_bytes,
-                   cudaMemcpyHostToDevice) != cudaSuccess) {
         return false;
     }
 

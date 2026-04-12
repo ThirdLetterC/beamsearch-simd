@@ -71,6 +71,9 @@ An attacker may influence:
   selection may run through an optional CUDA context. CUDA context creation and
   selection failures fall back to the CPU path; decoder-owned CUDA buffers are
   released by `beamsearch_decoder_destroy`.
+- CUDA benchmark helpers may preload synthetic log-probability matrices to a
+  decoder-owned device buffer to emulate device-resident model output. This is
+  benchmarking support only; callers still own pointer validity and lifetime.
 - Output reconstruction is delayed until after the best prefix length is known.
   If `output_capacity` is too small, the function returns
   `beamsearch_status_output_too_small` and reports the required length in

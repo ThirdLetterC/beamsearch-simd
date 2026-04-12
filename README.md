@@ -64,6 +64,12 @@ and falls back to the existing CPU selection path when CUDA is not compiled in,
 when the vocabulary is below the CUDA threshold, or when a CUDA context cannot
 be created.
 
+`just bench-cuda` prints the normal end-to-end host API table and an additional
+`cuda device-resident top-token selection` table. The second table uploads each
+synthetic log-probability matrix once before timing and then repeatedly selects
+top tokens from the resident device buffer, emulating an acoustic model that
+already produced logits on the GPU.
+
 The benchmark includes synthetic ASR shapes and 30-second, 16 kHz audio cases. The 30-second rows report `rtf`, where `0.01` means the decoder took about 1% of the audio duration.
 
 ## API

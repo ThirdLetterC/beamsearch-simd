@@ -37,6 +37,22 @@ bool beamsearch_cuda_select_top_tokens_batch(beamsearch_cuda_context_t *context,
                                              int32_t *tokens,
                                              size_t *selected_counts);
 
+[[nodiscard]]
+bool beamsearch_cuda_upload_log_probs(beamsearch_cuda_context_t *context,
+                                      const float *log_probs,
+                                      size_t frame_count,
+                                      size_t vocab_size);
+
+[[nodiscard]]
+bool beamsearch_cuda_select_top_tokens_batch_device(
+    beamsearch_cuda_context_t *context,
+    size_t frame_count,
+    size_t vocab_size,
+    size_t cutoff,
+    int32_t blank_id,
+    int32_t *tokens,
+    size_t *selected_counts);
+
 #ifdef __cplusplus
 }
 #endif

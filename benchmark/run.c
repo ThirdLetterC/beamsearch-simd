@@ -3,6 +3,9 @@
 #endif
 
 #include "beamsearch.h"
+#ifdef BEAMSEARCH_ENABLE_CUDA
+#include "beamsearch_cuda.h"
+#endif
 #include "psimd/psimd.h"
 
 #include <inttypes.h>
@@ -394,6 +397,161 @@ static void print_case(const benchmark_case_t *bench,
            measurement->checksum);
 }
 
+#ifdef BEAMSEARCH_ENABLE_CUDA
+[[nodiscard]]
+static uint64_t hash_cuda_selection(uint64_t hash,
+                                    const int32_t *tokens,
+                                    const size_t *selected_counts,
+                                    size_t frame_count,
+                                    size_t cutoff) {
+    for (size_t frame = 0; frame < frame_count; frame += 1) {
+        auto count = selected_counts[frame];
+        hash = hash_u64(hash, count);
+        for (size_t i = 0; i < count; i += 1) {
+            hash = hash_u64(hash, (uint32_t)tokens[frame * cutoff + i]);
+        }
+    }
+    return hash;
+}
+
+[[nodiscard]]
+static bool measure_cuda_resident_select(const benchmark_case_t *bench,
+                                         size_t repeat_scale,
+                                         double *seconds_out,
+                                         uint64_t *checksum_out) {
+    if (bench == nullptr || seconds_out == nullptr ||
+        checksum_out == nullptr || repeat_scale == 0 ||
+        bench->token_cutoff == 0 || bench->token_cutoff > 128) {
+        return false;
+    }
+
+    size_t value_count = 0;
+    size_t selected_entry_count = 0;
+    if (!checked_mul_size(bench->frame_count, bench->vocab_size,
+                          &value_count) ||
+        !checked_mul_size(bench->frame_count, bench->token_cutoff,
+                          &selected_entry_count)) {
+        return false;
+    }
+
+    auto log_probs = (float *)calloc(value_count, sizeof(float));
+    auto tokens = (int32_t *)calloc(selected_entry_count, sizeof(int32_t));
+    auto counts = (size_t *)calloc(bench->frame_count, sizeof(size_t));
+    if (log_probs == nullptr || tokens == nullptr || counts == nullptr) {
+        free(log_probs);
+        free(tokens);
+        free(counts);
+        return false;
+    }
+
+    auto context = beamsearch_cuda_context_create(
+        bench->frame_count, bench->vocab_size, bench->token_cutoff);
+    if (context == nullptr ||
+        !generate_log_probs(log_probs, bench->frame_count, bench->vocab_size,
+                            BENCHMARK_BLANK_ID, bench->seed) ||
+        !beamsearch_cuda_upload_log_probs(context, log_probs,
+                                          bench->frame_count,
+                                          bench->vocab_size)) {
+        beamsearch_cuda_context_destroy(context);
+        free(log_probs);
+        free(tokens);
+        free(counts);
+        return false;
+    }
+
+    for (size_t i = 0; i < bench->warmups; i += 1) {
+        if (!beamsearch_cuda_select_top_tokens_batch_device(
+                context, bench->frame_count, bench->vocab_size,
+                bench->token_cutoff, BENCHMARK_BLANK_ID, tokens, counts)) {
+            beamsearch_cuda_context_destroy(context);
+            free(log_probs);
+            free(tokens);
+            free(counts);
+            return false;
+        }
+    }
+
+    size_t repeats = 0;
+    if (!checked_mul_size(bench->repeats, repeat_scale, &repeats) ||
+        repeats == 0) {
+        beamsearch_cuda_context_destroy(context);
+        free(log_probs);
+        free(tokens);
+        free(counts);
+        return false;
+    }
+
+    auto hash = FNV_OFFSET;
+    auto start_ns = monotonic_ns();
+    for (size_t i = 0; i < repeats; i += 1) {
+        if (!beamsearch_cuda_select_top_tokens_batch_device(
+                context, bench->frame_count, bench->vocab_size,
+                bench->token_cutoff, BENCHMARK_BLANK_ID, tokens, counts)) {
+            beamsearch_cuda_context_destroy(context);
+            free(log_probs);
+            free(tokens);
+            free(counts);
+            return false;
+        }
+        hash = hash_cuda_selection(hash, tokens, counts, bench->frame_count,
+                                   bench->token_cutoff);
+    }
+    auto end_ns = monotonic_ns();
+    if (end_ns <= start_ns) {
+        beamsearch_cuda_context_destroy(context);
+        free(log_probs);
+        free(tokens);
+        free(counts);
+        return false;
+    }
+
+    *seconds_out = (double)(end_ns - start_ns) / NS_PER_SECOND;
+    *checksum_out = hash;
+
+    beamsearch_cuda_context_destroy(context);
+    free(log_probs);
+    free(tokens);
+    free(counts);
+    return true;
+}
+
+static void print_cuda_resident_select(const benchmark_case_t *cases,
+                                       size_t case_count,
+                                       size_t repeat_scale) {
+    printf("\ncuda device-resident top-token selection\n");
+    printf("%-20s %7s %7s %6s %8s %12s %12s %18s\n",
+           "case", "frames", "vocab", "cutoff", "repeats", "ms/select",
+           "scores/s", "checksum");
+
+    for (size_t i = 0; i < case_count; i += 1) {
+        if (cases[i].vocab_size < 65'536 || cases[i].token_cutoff > 128) {
+            continue;
+        }
+
+        double seconds = 0.0;
+        uint64_t checksum = 0;
+        if (!measure_cuda_resident_select(&cases[i], repeat_scale, &seconds,
+                                          &checksum)) {
+            printf("%-20s %7zu %7zu %6zu %8s %12s %12s %18s\n",
+                   cases[i].name, cases[i].frame_count, cases[i].vocab_size,
+                   cases[i].token_cutoff, "-", "failed", "-", "-");
+            continue;
+        }
+
+        auto repeats = cases[i].repeats * repeat_scale;
+        auto ms_per_select = seconds * 1'000.0 / (double)repeats;
+        auto scores_per_second =
+            ((double)cases[i].frame_count * (double)cases[i].vocab_size *
+             (double)repeats) /
+            seconds;
+        printf("%-20s %7zu %7zu %6zu %8zu %12.3f %12.0f 0x%016" PRIx64 "\n",
+               cases[i].name, cases[i].frame_count, cases[i].vocab_size,
+               cases[i].token_cutoff, repeats, ms_per_select,
+               scores_per_second, checksum);
+    }
+}
+#endif
+
 [[nodiscard]]
 static size_t parse_repeat_scale(int argc, char **argv) {
     if (argc < 2 || argv == nullptr || argv[1] == nullptr) {
@@ -631,6 +789,11 @@ int main(int argc, char **argv) {
         }
         print_case(&cases[i], repeat_scale, &measurement);
     }
+
+#ifdef BEAMSEARCH_ENABLE_CUDA
+    print_cuda_resident_select(cases, sizeof(cases) / sizeof(cases[0]),
+                               repeat_scale);
+#endif
 
     printf("\nBuild once with default flags and once with -mavx2 -mfma to compare "
            "psimd backends.\n");
