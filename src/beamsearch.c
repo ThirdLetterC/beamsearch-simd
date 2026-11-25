@@ -22,6 +22,11 @@ static constexpr size_t BEAMSEARCH_MIN_CUDA_SELECT_TOKENS = 65'536;
 static constexpr size_t BEAMSEARCH_MAX_CUDA_SELECT_CUTOFF = 128;
 #endif
 static constexpr uint32_t BEAMSEARCH_INITIAL_EPOCH = 1;
+/* The trie is compacted to the live beams' ancestors once it holds this many nodes, or
+   BEAMSEARCH_TRIE_GROWTH times the nodes that survived the previous compaction. */
+static constexpr size_t BEAMSEARCH_MIN_COMPACT_NODES = 65'536;
+static constexpr size_t BEAMSEARCH_TRIE_GROWTH = 4;
+static constexpr size_t BEAMSEARCH_MARKED_NODE = SIZE_MAX - 1;
 
 typedef struct {
     size_t parent;
@@ -40,7 +45,7 @@ typedef struct {
     size_t parent;
     int32_t token;
     size_t child;
-    bool occupied;
+    uint32_t epoch; /* occupied when equal to the decoder's child_epoch */
 } beamsearch_child_slot_t;
 
 typedef struct {
@@ -90,9 +95,17 @@ struct beamsearch_decoder {
     size_t node_count;
     size_t node_capacity;
 
+    /* (parent, token) -> child for the current frame only: cleared (by epoch) and re-seeded
+       with the live beams' own edges every frame, so it stays O(beam * cutoff). */
     beamsearch_child_slot_t *child_slots;
     size_t child_count;
     size_t child_capacity;
+    uint32_t child_epoch;
+
+    /* Scratch for compaction: old node index -> new index. */
+    size_t *node_map;
+    size_t node_map_capacity;
+    size_t compact_threshold;
 
     beamsearch_accum_slot_t *accum_slots;
     size_t accum_count;
@@ -645,7 +658,7 @@ static void child_insert_existing(beamsearch_child_slot_t *slots,
                                   size_t capacity,
                                   beamsearch_child_slot_t slot) {
     auto index = hash_child(slot.parent, slot.token) & (capacity - 1);
-    while (slots[index].occupied) {
+    while (slots[index].epoch == slot.epoch) {
         index = (index + 1) & (capacity - 1);
     }
     slots[index] = slot;
@@ -669,7 +682,7 @@ static bool ensure_child_capacity(beamsearch_decoder_t *decoder,
     }
 
     for (size_t i = 0; i < decoder->child_capacity; i += 1) {
-        if (decoder->child_slots[i].occupied) {
+        if (decoder->child_slots[i].epoch == decoder->child_epoch) {
             child_insert_existing(slots, capacity, decoder->child_slots[i]);
         }
     }
@@ -762,13 +775,24 @@ static void accum_add_nonblank(beamsearch_decoder_t *decoder, size_t node,
     slot->p_nonblank = logaddexp_pair(slot->p_nonblank, value);
 }
 
-static void reset_trie(beamsearch_decoder_t *decoder) {
-    if (decoder->child_capacity != 0) {
-        memset(decoder->child_slots, 0,
-               decoder->child_capacity * sizeof(decoder->child_slots[0]));
+/* Empties the child table in O(1) by moving to a new epoch (a full clear only when the epoch
+   counter wraps). */
+static void clear_children(beamsearch_decoder_t *decoder) {
+    if (decoder->child_epoch == UINT32_MAX) {
+        if (decoder->child_capacity != 0) {
+            memset(decoder->child_slots, 0,
+                   decoder->child_capacity * sizeof(decoder->child_slots[0]));
+        }
+        decoder->child_epoch = BEAMSEARCH_INITIAL_EPOCH;
+    } else {
+        decoder->child_epoch += 1;
     }
-
     decoder->child_count = 0;
+}
+
+static void reset_trie(beamsearch_decoder_t *decoder) {
+    clear_children(decoder);
+    decoder->compact_threshold = BEAMSEARCH_MIN_COMPACT_NODES;
     decoder->node_count = 1;
     decoder->nodes[0].parent = BEAMSEARCH_INVALID_NODE;
     decoder->nodes[0].token = -1;
@@ -796,7 +820,7 @@ static bool get_or_create_child(beamsearch_decoder_t *decoder,
     }
 
     auto index = hash_child(parent, token) & (decoder->child_capacity - 1);
-    while (decoder->child_slots[index].occupied) {
+    while (decoder->child_slots[index].epoch == decoder->child_epoch) {
         if (decoder->child_slots[index].parent == parent &&
             decoder->child_slots[index].token == token) {
             *child_out = decoder->child_slots[index].child;
@@ -814,7 +838,7 @@ static bool get_or_create_child(beamsearch_decoder_t *decoder,
     decoder->child_slots[index].parent = parent;
     decoder->child_slots[index].token = token;
     decoder->child_slots[index].child = child;
-    decoder->child_slots[index].occupied = true;
+    decoder->child_slots[index].epoch = decoder->child_epoch;
     decoder->child_count += 1;
 
     *child_out = child;
@@ -982,9 +1006,115 @@ static bool select_top_tokens(beamsearch_decoder_t *decoder,
     return true;
 }
 
+/* Keeps only the nodes on the live beams' ancestor chains (and the root), renumbered in their
+   old order, so parents still precede children. Results are unchanged: dead nodes are
+   unreachable from every beam. */
+[[nodiscard]]
+static bool compact_trie(beamsearch_decoder_t *decoder) {
+    if (decoder->node_map_capacity < decoder->node_count) {
+        auto capacity = grow_capacity(decoder->node_map_capacity, decoder->node_count);
+        if (capacity == 0) {
+            return false;
+        }
+        auto map = (size_t *)calloc_array(capacity, sizeof(size_t));
+        if (map == nullptr) {
+            return false;
+        }
+        free(decoder->node_map);
+        decoder->node_map = map;
+        decoder->node_map_capacity = capacity;
+    }
+    auto map = decoder->node_map;
+    for (size_t i = 0; i < decoder->node_count; i += 1) {
+        map[i] = BEAMSEARCH_INVALID_NODE;
+    }
+    map[0] = BEAMSEARCH_MARKED_NODE;
+    for (size_t i = 0; i < decoder->current_count; i += 1) {
+        auto node = decoder->current_beams[i].node;
+        while (node != BEAMSEARCH_INVALID_NODE && map[node] == BEAMSEARCH_INVALID_NODE) {
+            map[node] = BEAMSEARCH_MARKED_NODE;
+            node = decoder->nodes[node].parent;
+        }
+    }
+
+    size_t kept = 0;
+    for (size_t old = 0; old < decoder->node_count; old += 1) {
+        if (map[old] == BEAMSEARCH_INVALID_NODE) {
+            continue;
+        }
+        auto node = decoder->nodes[old];
+        if (node.parent != BEAMSEARCH_INVALID_NODE) {
+            node.parent = map[node.parent]; /* parents precede children: already renumbered */
+        }
+        map[old] = kept;
+        decoder->nodes[kept] = node;
+        kept += 1;
+    }
+    for (size_t i = 0; i < decoder->current_count; i += 1) {
+        decoder->current_beams[i].node = map[decoder->current_beams[i].node];
+    }
+    decoder->node_count = kept;
+
+    size_t threshold = 0;
+    if (!checked_mul_size(kept, BEAMSEARCH_TRIE_GROWTH, &threshold)) {
+        threshold = SIZE_MAX;
+    }
+    decoder->compact_threshold =
+        threshold > BEAMSEARCH_MIN_COMPACT_NODES ? threshold : BEAMSEARCH_MIN_COMPACT_NODES;
+    return true;
+}
+
+/* Starts a frame's child table with one edge per live beam, (parent, token) -> beam node:
+   extending a beam with a token that leads to another live beam must find that beam's node
+   so their probabilities merge. Edges to nodes that are not live are not needed: a fresh node
+   for such a prefix has no live hypothesis to merge with. */
+[[nodiscard]]
+static bool seed_children(beamsearch_decoder_t *decoder, size_t selected_count) {
+    if (decoder->node_count > decoder->compact_threshold && !compact_trie(decoder)) {
+        return false;
+    }
+    clear_children(decoder);
+
+    size_t expansions = 0;
+    size_t required = 0;
+    if (!checked_mul_size(decoder->current_count, selected_count, &expansions) ||
+        !checked_add_size(expansions, decoder->current_count, &required) ||
+        !ensure_child_capacity(decoder, required)) {
+        return false;
+    }
+
+    for (size_t i = 0; i < decoder->current_count; i += 1) {
+        auto node = decoder->current_beams[i].node;
+        auto parent = decoder->nodes[node].parent;
+        if (parent == BEAMSEARCH_INVALID_NODE) {
+            continue; /* the root */
+        }
+        auto token = decoder->nodes[node].token;
+        auto index = hash_child(parent, token) & (decoder->child_capacity - 1);
+        while (decoder->child_slots[index].epoch == decoder->child_epoch &&
+               !(decoder->child_slots[index].parent == parent &&
+                 decoder->child_slots[index].token == token)) {
+            index = (index + 1) & (decoder->child_capacity - 1);
+        }
+        if (decoder->child_slots[index].epoch != decoder->child_epoch) {
+            decoder->child_slots[index] = (beamsearch_child_slot_t){
+                .parent = parent,
+                .token = token,
+                .child = node,
+                .epoch = decoder->child_epoch,
+            };
+            decoder->child_count += 1;
+        }
+    }
+    return true;
+}
+
 [[nodiscard]]
 static bool prepare_frame_storage(beamsearch_decoder_t *decoder,
                                   size_t selected_count) {
+    if (!seed_children(decoder, selected_count)) {
+        return false;
+    }
     size_t selected_with_blank = 0;
     if (!checked_add_size(selected_count, 1, &selected_with_blank)) {
         return false;
@@ -1597,6 +1727,8 @@ beamsearch_decoder_t *beamsearch_decoder_create(
         sanitize_thread_count(decoder->config.thread_count);
     decoder->thread_count = decoder->config.thread_count;
     decoder->accum_epoch = BEAMSEARCH_INITIAL_EPOCH;
+    decoder->child_epoch = BEAMSEARCH_INITIAL_EPOCH;
+    decoder->compact_threshold = BEAMSEARCH_MIN_COMPACT_NODES;
 
     if (!ensure_node_capacity(decoder, 1) ||
         !ensure_child_capacity(decoder, BEAMSEARCH_MIN_HASH_CAPACITY / 2) ||
@@ -1621,6 +1753,7 @@ void beamsearch_decoder_destroy(beamsearch_decoder_t *decoder) {
     stop_worker_pool(decoder);
 
     free(decoder->nodes);
+    free(decoder->node_map);
     free(decoder->child_slots);
     free(decoder->accum_slots);
     free(decoder->current_beams);

@@ -458,6 +458,82 @@ static void test_threaded_heavy_expansion_matches() {
     free(log_probs);
 }
 
+/* A long decode creates millions of candidate prefixes, so the trie is compacted many times:
+ * the reconstructed tokens must survive renumbering, and the single-thread, threaded and
+ * reused-decoder results must agree. */
+static void test_long_decode_compacts_trie() {
+    constexpr size_t groups = 2'000;
+    constexpr size_t frame_count = groups * 3;
+    constexpr size_t vocab_size = 40;
+    auto single = new_decoder_threads(16, vocab_size - 1, 0, 1);
+    auto threaded = new_decoder_threads(16, vocab_size - 1, 0, 4);
+    auto log_probs = (float *)calloc(frame_count * vocab_size, sizeof(float));
+    auto expected = (int32_t *)calloc(groups, sizeof(int32_t));
+    auto single_output = (int32_t *)calloc(frame_count, sizeof(int32_t));
+    auto threaded_output = (int32_t *)calloc(frame_count, sizeof(int32_t));
+    auto again_output = (int32_t *)calloc(frame_count, sizeof(int32_t));
+    beamsearch_result_t single_result = {0};
+    beamsearch_result_t threaded_result = {0};
+    beamsearch_result_t again_result = {0};
+
+    check(single != nullptr && threaded != nullptr && log_probs != nullptr &&
+              expected != nullptr && single_output != nullptr &&
+              threaded_output != nullptr && again_output != nullptr,
+          "long decode setup");
+    if (single == nullptr || threaded == nullptr || log_probs == nullptr ||
+        expected == nullptr || single_output == nullptr ||
+        threaded_output == nullptr || again_output == nullptr) {
+        goto cleanup;
+    }
+
+    /* token, token, blank per group; every other label keeps a little mass so that all
+     * cutoff tokens are expanded every frame */
+    for (size_t frame = 0; frame < frame_count; frame += 1) {
+        auto group = frame / 3;
+        auto token = (int32_t)(group % (vocab_size - 1) + 1);
+        auto peak = frame % 3 == 2 ? 0 : token;
+        for (size_t label = 0; label < vocab_size; label += 1) {
+            log_probs[frame * vocab_size + label] =
+                logf(label == (size_t)peak ? 0.7f : 0.3f / (float)(vocab_size - 1));
+        }
+        expected[group] = token;
+    }
+
+    auto single_status = beamsearch_decoder_decode(
+        single, log_probs, frame_count, vocab_size, single_output, frame_count,
+        &single_result);
+    auto threaded_status = beamsearch_decoder_decode(
+        threaded, log_probs, frame_count, vocab_size, threaded_output,
+        frame_count, &threaded_result);
+    auto again_status = beamsearch_decoder_decode(
+        single, log_probs, frame_count, vocab_size, again_output, frame_count,
+        &again_result);
+
+    check(single_status == beamsearch_status_ok &&
+              threaded_status == beamsearch_status_ok &&
+              again_status == beamsearch_status_ok,
+          "long decode status");
+    check(same_tokens(single_output, single_result.token_count, expected, groups),
+          "long decode tokens");
+    check(same_tokens(single_output, single_result.token_count, threaded_output,
+                      threaded_result.token_count) &&
+              nearly_equal(single_result.log_score, threaded_result.log_score),
+          "long decode threaded matches");
+    check(same_tokens(single_output, single_result.token_count, again_output,
+                      again_result.token_count) &&
+              nearly_equal(single_result.log_score, again_result.log_score),
+          "long decode reused decoder matches");
+
+cleanup:
+    beamsearch_decoder_destroy(single);
+    beamsearch_decoder_destroy(threaded);
+    free(log_probs);
+    free(expected);
+    free(single_output);
+    free(threaded_output);
+    free(again_output);
+}
+
 int main() {
     test_empty_input();
     test_invalid_arguments();
@@ -469,6 +545,7 @@ int main() {
     test_threaded_matches_single_thread();
     test_threaded_heavy_expansion_matches();
     test_thread_count_is_bounded();
+    test_long_decode_compacts_trie();
 
     return g_failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

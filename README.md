@@ -16,6 +16,9 @@ It returns the single best collapsed token-id sequence and its log score. Versio
 - psimd-accelerated per-frame token pruning.
 - Optional CUDA per-frame token pruning for very large vocabularies.
 - Parent-linked trie prefixes to avoid copying token arrays during search.
+- Bounded trie: the child lookup table is rebuilt each frame from the live beams only, so it stays
+  cache-resident (O(beam_width x token_cutoff)), and dead prefixes are compacted away once the
+  trie grows past 4x its last live size (at least 65,536 nodes), keeping memory flat on long audio.
 - Optional pthread worker path for larger beam expansion workloads.
 - Caller-owned output buffer and reusable decoder scratch memory.
 
